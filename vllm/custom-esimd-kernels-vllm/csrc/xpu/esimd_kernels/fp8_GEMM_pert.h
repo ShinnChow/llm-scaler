@@ -151,6 +151,15 @@ struct GEMV_fp8_pert_batched_kernel {
 // Each single-thread WG handles output[m_start:m_start+TILE_M, n]
 // Weight row loaded once, reused across TILE_M input rows
 // ============================================================================
+template<typename T, int VL>
+SYCL_ESIMD_FUNCTION inline simd<T, VL> fp8_ws_block_load(
+    const T* ptr, bool unaligned) {
+    if (unaligned) {
+        return block_load<T, VL>(ptr, properties{alignment<sizeof(T)>});
+    }
+    return block_load<T, VL>(ptr);
+}
+
 template<int VL, int TILE_M>
 struct GEMM_fp8_pert_ws_kernel {
     const fp16*    input;      // [M, K]
@@ -169,40 +178,60 @@ struct GEMM_fp8_pert_ws_kernel {
         simd<float, VL> acc[TILE_M];
         #pragma unroll
         for (int i = 0; i < TILE_M; i++) acc[i] = 0.0f;
+        const bool unaligned = K % 4 != 0;
 
         // Main loop: process full VL chunks
         int k_aligned = (K / VL) * VL;
         for (int k = 0; k < k_aligned; k += VL) {
-            simd<uint8_t, VL> raw = block_load<uint8_t, VL>(weight + (size_t)n * K + k);
+            simd<uint8_t, VL> raw = fp8_ws_block_load<uint8_t, VL>(
+                weight + (size_t)n * K + k, unaligned);
             simd<float, VL> wf = fp8_dequant<VL>(raw, fp8_mode);
 
             #pragma unroll
             for (int i = 0; i < TILE_M; i++) {
                 if (m_start + i < M) {
-                    simd<fp16, VL> iv = block_load<fp16, VL>(
-                        input + (size_t)(m_start + i) * K + k);
+                    simd<fp16, VL> iv = fp8_ws_block_load<fp16, VL>(
+                        input + (size_t)(m_start + i) * K + k, unaligned);
                     acc[i] += simd<float, VL>(iv) * wf;
                 }
             }
         }
-        // Tail: overlap-read last VL elements (re-processes some, but
-        // accumulator zeroed for overlap portion via mask subtraction)
+        // Tail: short rows must be loaded element by element; an overlap
+        // block load would start before the row when K < VL.
         if (k_aligned < K) {
-            int k_tail = K - VL;  // read last VL elements (overlaps with end of main loop)
-            simd<uint8_t, VL> raw = block_load<uint8_t, VL>(weight + (size_t)n * K + k_tail);
-            simd<float, VL> wf = fp8_dequant<VL>(raw, fp8_mode);
-            // Mask: only accumulate the tail portion [k_aligned..K)
-            // Elements [0..k_aligned-k_tail) were already accumulated in main loop
-            int overlap = k_aligned - k_tail;
-            // Zero out the overlapping prefix so we dont double-count
-            for (int z = 0; z < overlap; z++) wf[z] = 0.0f;
+            if (K < VL) {
+                simd<uint8_t, VL> raw = 0;
+                for (int k = 0; k < K; k++) {
+                    raw[k] = weight[(size_t)n * K + k];
+                }
+                simd<float, VL> wf = fp8_dequant<VL>(raw, fp8_mode);
+                #pragma unroll
+                for (int i = 0; i < TILE_M; i++) {
+                    if (m_start + i < M) {
+                        simd<fp16, VL> iv = 0;
+                        for (int k = 0; k < K; k++) {
+                            iv[k] = input[(size_t)(m_start + i) * K + k];
+                        }
+                        acc[i] += simd<float, VL>(iv) * wf;
+                    }
+                }
+            } else {
+                int k_tail = K - VL;
+                simd<uint8_t, VL> raw = fp8_ws_block_load<uint8_t, VL>(
+                    weight + (size_t)n * K + k_tail, unaligned);
+                simd<float, VL> wf = fp8_dequant<VL>(raw, fp8_mode);
+                // Only accumulate the tail portion [k_aligned, K).
+                int overlap = k_aligned - k_tail;
+                for (int z = 0; z < overlap; z++) wf[z] = 0.0f;
 
-            #pragma unroll
-            for (int i = 0; i < TILE_M; i++) {
-                if (m_start + i < M) {
-                    simd<fp16, VL> iv = block_load<fp16, VL>(
-                        input + (size_t)(m_start + i) * K + k_tail);
-                    acc[i] += simd<float, VL>(iv) * wf;
+                #pragma unroll
+                for (int i = 0; i < TILE_M; i++) {
+                    if (m_start + i < M) {
+                        simd<fp16, VL> iv = fp8_ws_block_load<fp16, VL>(
+                            input + (size_t)(m_start + i) * K + k_tail,
+                            unaligned);
+                        acc[i] += simd<float, VL>(iv) * wf;
+                    }
                 }
             }
         }
@@ -4037,13 +4066,21 @@ inline void GEMM_fp8_pert_dispatch(
     sycl::queue& q) {
 
     if (M == 1) {
-        batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        // GEMV reads full VL chunks (VL >= 32). A K tail would read into
+        // the next weight row; Gemma4 TP=4 has K=528 for its down projection.
+        if (K % 32 == 0) {
+            batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        } else {
+            ws_gemm_fp8_pert_host<64, 1>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        }
     } else if (N <= 16 && M >= 2) {
         // Tiny-N M-parallel: one WG per input row, K_SPLIT threads per WG.
         // Grid={M×K_SPLIT}. Weight (N*K bytes) in L3. Avoids N-parallel
         // underutilization that causes 2x cliff at M=9 in V7/WS kernels.
-        // K_SPLIT chosen so K/K_SPLIT is divisible by VL=128.
-        if (K >= 2048 && K % (8 * 128) == 0) {
+        // M-parallel loads full VL=128 chunks; use WS for an unaligned K.
+        if (K % 128 != 0) {
+            ws_gemm_fp8_pert_host<64, 8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        } else if (K >= 2048 && K % (8 * 128) == 0) {
             mpar_gemm_fp8_pert_host<128, 8, 16>(
                 input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
         } else if (K % (4 * 128) == 0) {
@@ -4066,7 +4103,11 @@ inline void GEMM_fp8_pert_dispatch(
         // V7: K-split multi-thread WG for E5M2 or when V9 not applicable
         dpas_v7_auto_dispatch(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else if (M <= 3) {
-        batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        if (K % 32 == 0) {
+            batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        } else {
+            ws_gemm_fp8_pert_host<64, 8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        }
     } else if (M <= 8) {
         ws_gemm_fp8_pert_host<128, 8>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else {
